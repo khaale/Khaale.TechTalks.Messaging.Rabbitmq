@@ -20,13 +20,13 @@ namespace Khaale.TechTalks.Messaging.Rabbit.Samples.Infrastructure
 
 		public IConnection CreateConnection()
 		{
-			var factory = new ConnectionFactory { HostName = "localhost", VirtualHost = VirtualHost };
+			var factory = new ConnectionFactory { HostName = "localhost", VirtualHost = VirtualHost, UserName = "test", Password = "test" };
 			return factory.CreateConnection();
 		}
 
 		public void Initialize()
 		{
-			var factory = new ConnectionFactory { HostName = "localhost", VirtualHost = VirtualHost };
+			var factory = new ConnectionFactory { HostName = "localhost", VirtualHost = VirtualHost, UserName = "test", Password = "test" };
 			_connection = factory.CreateConnection();
 			_internalChannel = _connection.CreateModel();
 		}

@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Khaale.TechTalks.Messaging.Rabbit.Samples.Demo.DAL;
 using Khaale.TechTalks.Messaging.Rabbit.Samples.Demo.Entities;
 using Khaale.TechTalks.Messaging.Rabbit.Samples.Infrastructure;
+using Nito.AsyncEx;
 using NUnit.Framework;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
@@ -99,41 +100,47 @@ namespace Khaale.TechTalks.Messaging.Rabbit.Samples
 		[Test]
 		public void Publish_AtMostOnce()
 		{
-			//arrange
-			Func<int, Task> publish = async id =>
+			using (var channel = _publisher.CreateChannel())
 			{
-				using (var ctx = new DemoDataContext())
-				//Transaction Scope with async was fixed only in .NET 4.5.1
-				//Transaction Scope usage is not recommended by MS
-				using (var tx = ctx.Database.BeginTransaction())
-				//TODO: is it OK to create channel for a single publish from a performance point of view?
-				using (var channel = _publisher.CreateChannel())
+				var locker = new AsyncLock();
+				//arrange
+				Func<int, Task> publish = async id =>
 				{
-					//create new item
-					var newItem = new ProducedItem { Id = id, IsSent = false };
-					ctx.ProducedItems.Add(newItem);
+					using (var ctx = new DemoDataContext())
+						//Transaction Scope with async was fixed only in .NET 4.5.1
+						//Transaction Scope usage is not recommended by MS
+					using (var tx = ctx.Database.BeginTransaction())
+					{
+						//create new item
+						var newItem = new ProducedItem {Id = id, IsSent = false};
+						ctx.ProducedItems.Add(newItem);
 
-					//send message
-					var message = _publisher.PrepareMessage(id.ToString());
+						//send message
+						var message = _publisher.PrepareMessage(id.ToString());
 
-					channel.BasicPublish("", RabbitFacade.QueueName, message.Item2, message.Item1);
-					newItem.IsSent = true;
+						using (await locker.LockAsync())
+						{
+							channel.BasicPublish("", RabbitFacade.QueueName, message.Item2, message.Item1);
+						}
 
-					//ThrowException(50, ref _counter);
+						newItem.IsSent = true;
 
-					//commit
-					await ctx.SaveChangesAsync();
-					tx.Commit();
-				}
-			};
+						//ThrowException(50, ref _counter);
 
-			//act			
-			var completed = RunPublish(publish, 100);
+						//commit
+						await ctx.SaveChangesAsync();
+						tx.Commit();
+					}
+				};
 
-			//assert
-			Assert.That(completed, Is.True);
-			var messagesCount = _publisher.GetMessageCount(RabbitFacade.QueueName);
-			Assert.That(messagesCount, Is.EqualTo(100));
+				//act			
+				var completed = RunPublish(publish, 100);
+
+				//assert
+				Assert.That(completed, Is.True);
+				var messagesCount = _publisher.GetMessageCount(RabbitFacade.QueueName);
+				Assert.That(messagesCount, Is.EqualTo(100));
+			}
 		}
 		
 		[Test]
@@ -193,11 +200,13 @@ namespace Khaale.TechTalks.Messaging.Rabbit.Samples
 		public void Publish_AtLeastOnce_Transactional()
 		{
 			//arrange
+			var channelPool = new AsyncProducerConsumerQueue<IModel>(
+				Enumerable.Range(1, 10).Select(_ => _publisher.CreateChannel()));
+
 			Func<int, Task> publish = async id =>
 			{
 				using (var ctx = new DemoDataContext())
 				using (var tx = ctx.Database.BeginTransaction())
-				using (var channel = _publisher.CreateChannel())
 				{
 					//create new item
 					var newItem = new ProducedItem { Id = id, IsSent = false };
@@ -206,6 +215,7 @@ namespace Khaale.TechTalks.Messaging.Rabbit.Samples
 					//send message
 					var message = _publisher.PrepareMessage(id.ToString());
 
+					var channel = await channelPool.DequeueAsync();
 					try
 					{
 						channel.TxSelect();
@@ -221,7 +231,10 @@ namespace Khaale.TechTalks.Messaging.Rabbit.Samples
 						channel.TxRollback();
 						throw;
 					}
-
+					finally
+					{
+						channelPool.Enqueue(channel);
+					}
 					//commit
 					await ctx.SaveChangesAsync();
 					tx.Commit();
@@ -240,72 +253,80 @@ namespace Khaale.TechTalks.Messaging.Rabbit.Samples
 		[Test]
 		public void Publish_AtLeastOnce_PublisherConfirm()
 		{
-			//configuring main processing
-			Func<int, Task> publishFunc = (async id =>
+			var locker = new AsyncLock();
+			using (var channel = _publisher.CreateChannel())
 			{
-				using (var ctx = new DemoDataContext())
-				using (var tx = ctx.Database.BeginTransaction())
-				using (var channel = _publisher.CreateChannel())
+				//configuring acks processing
+				var pendingAckTasks = new ConcurrentDictionary<ulong, TaskCompletionSource<ulong>>();
+				channel.ConfirmSelect();
+				channel.BasicAcks += (model, args) =>
 				{
-					//configuring acks processing
-					var pendingAckTasks = new ConcurrentDictionary<ulong, TaskCompletionSource<ulong>>();
-					channel.ConfirmSelect();
-					channel.BasicAcks += (model, args) =>
+					Debug.WriteLine("Confirm: dt={0}, multiple={1}", args.DeliveryTag, args.Multiple);
+					if (!args.Multiple)
 					{
-						Debug.WriteLine("Confirm: dt={0}, multiple={1}", args.DeliveryTag, args.Multiple);
-						if (!args.Multiple)
+						TaskCompletionSource<ulong> tcs;
+						if (pendingAckTasks.TryGetValue(args.DeliveryTag, out tcs))
 						{
-							TaskCompletionSource<ulong> tcs;
-							if (pendingAckTasks.TryGetValue(args.DeliveryTag, out tcs))
-							{
-								tcs.TrySetResult(args.DeliveryTag);
-							}
+							tcs.TrySetResult(args.DeliveryTag);
 						}
-						else
-						{
-							foreach (var kvp in pendingAckTasks.Where(kvp => kvp.Key <= args.DeliveryTag))
-							{
-								kvp.Value.TrySetResult(args.DeliveryTag);
-							}
-						}
-					};
-
-					//create new item
-					var newItem = new ProducedItem { Id = id, IsSent = false };
-					ctx.ProducedItems.Add(newItem);
-
-					//send message
-					var message = _publisher.PrepareMessage(id.ToString());
-
-					var deliveryTag = channel.NextPublishSeqNo;
-					var ackReceived = new TaskCompletionSource<ulong>(deliveryTag);
-					pendingAckTasks[deliveryTag] = ackReceived;
-
-					channel.BasicPublish("", RabbitFacade.QueueName, message.Item2, message.Item1);
-
-					//async waiting for ack
-					if (await Task.WhenAny(ackReceived.Task, Task.Delay(TimeSpan.FromSeconds(1))) != ackReceived.Task)
-					{
-						ackReceived.TrySetCanceled();
-						throw new ApplicationException(string.Format("Id = {0}, DeliveryTag = {1}: Message wasn't acked!", id, deliveryTag));
 					}
+					else
+					{
+						foreach (var kvp in pendingAckTasks.Where(kvp => kvp.Key <= args.DeliveryTag))
+						{
+							kvp.Value.TrySetResult(args.DeliveryTag);
+						}
+					}
+				};
+	
+				//configuring main processing
+				Func<int, Task> publishFunc = (async id =>
+				{
+					using (var ctx = new DemoDataContext())
+					using (var tx = ctx.Database.BeginTransaction())
+					{
+						//create new item
+						var newItem = new ProducedItem {Id = id, IsSent = false};
+						ctx.ProducedItems.Add(newItem);
 
-					newItem.IsSent = true;
+						//send message
+						var message = _publisher.PrepareMessage(id.ToString());
 
-					//commit
-					await ctx.SaveChangesAsync();
-					tx.Commit();
-				}
-			});
+						var deliveryTag = channel.NextPublishSeqNo;
+						var ackReceived = new TaskCompletionSource<ulong>(deliveryTag);
+						pendingAckTasks[deliveryTag] = ackReceived;
 
-			//act			
-			var completed = RunPublish(publishFunc, 100);
+						using (await locker.LockAsync())
+						{
+							channel.BasicPublish("", RabbitFacade.QueueName, message.Item2, message.Item1);
+						}
 
-			//assert
-			Assert.That(completed, Is.True);
-			var messagesCount = _publisher.GetMessageCount(RabbitFacade.QueueName);
+						//async waiting for ack
+						if (await Task.WhenAny(ackReceived.Task, Task.Delay(TimeSpan.FromSeconds(1))) != ackReceived.Task)
+						{
+							ackReceived.TrySetCanceled();
+							throw new ApplicationException(string.Format("Id = {0}, DeliveryTag = {1}: Message wasn't acked!", id,
+								deliveryTag));
+						}
+
+						newItem.IsSent = true;
+
+						//commit
+						await ctx.SaveChangesAsync();
+						tx.Commit();
+					}
+				});
+
+				//act			
+				var completed = RunPublish(publishFunc, 100);
+
+				//assert
+				Assert.That(completed, Is.True);
+				var messagesCount = _publisher.GetMessageCount(RabbitFacade.QueueName);
+			
 			Assert.That(messagesCount, Is.EqualTo(100));
 		}
+	}
 
 		[Test]
 		public void Consume_AtLeastOnce()
